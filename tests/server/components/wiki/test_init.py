@@ -23,7 +23,7 @@ async def test_wiki_component_lifecycle(component_core: ServerCore) -> None:
     assert isinstance(component, Component)
     assert component.domain == "wiki"
     assert component.dependencies == ("ai", "events")
-    assert component.platforms == ()
+    assert component.platforms == ("http", "mcp")
 
     loader = ComponentLoader()
     loader.register(AiComponent())
