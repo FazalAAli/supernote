@@ -95,12 +95,14 @@ class OcrModule(ProcessorModule):
         session_manager: DatabaseSessionManager,
         page_index: int | None = None,
         page_id: str | None = None,
+        *,
+        user_id: int,
     ) -> bool:
         if page_index is None:
             return False
 
         if not await super().run_if_needed(
-            file_id, session_manager, page_index, page_id
+            file_id, session_manager, page_index, page_id, user_id=user_id
         ):
             return False
 
