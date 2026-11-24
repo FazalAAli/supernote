@@ -910,7 +910,10 @@ class ProcessorService:
                         "page_" + NotePageContentDO.page_id == SystemTaskDO.key,
                     ),
                 )
-                .where(UserFileDO.user_id == user_id)
+                .where(
+                    UserFileDO.user_id == user_id,
+                    UserFileDO.is_active == "Y",
+                )
                 .order_by(status_priority.asc(), SystemTaskDO.update_time.desc())
                 .limit(limit)
             )
@@ -921,6 +924,7 @@ class ProcessorService:
                 owned_in_flight = await session.execute(
                     select(UserFileDO.id).where(
                         UserFileDO.user_id == user_id,
+                        UserFileDO.is_active == "Y",
                         UserFileDO.id.in_(in_flight_candidates),
                     )
                 )
@@ -972,7 +976,13 @@ class ProcessorService:
             await session.execute(
                 delete(SystemTaskDO).where(
                     SystemTaskDO.file_id.in_(target_file_ids),
-                    SystemTaskDO.status == ProcessingStatus.FAILED,
+                    or_(
+                        SystemTaskDO.status == ProcessingStatus.FAILED,
+                        and_(
+                            SystemTaskDO.key == "global",
+                            SystemTaskDO.task_type != TaskType.PAGE_HASHING.value,
+                        ),
+                    ),
                 )
             )
             await session.commit()
