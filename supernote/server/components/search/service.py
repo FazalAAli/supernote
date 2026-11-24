@@ -1,8 +1,9 @@
-"""Semantic vector search and notebook listing service.
+"""Hybrid keyword + semantic vector search and notebook listing service.
 
-`SearchService` orchestrates `EmbeddingChunkSearcher` (`supernote.server.components.search.chunk_search`)
-across active `.note` pages, supporting filename substring filters and ISO 8601 date
-bounds (`infer_page_date`), alongside active `.note` notebook listing.
+`SearchService` orchestrates `KeywordChunkSearcher` (matching native Supernote
+`NotePageMetadataDO` keywords and SQL-prefiltered `NotePageContentDO` transcripts)
+alongside `EmbeddingChunkSearcher` (computing cosine similarity via `EmbeddingModel`)
+inside a single SQLite read snapshot, merging results via `rank_and_merge_results`.
 
 ### Internal Component Access
 
@@ -22,7 +23,13 @@ from supernote.server.ai.models.embedding import EmbeddingModel
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.session import DatabaseSessionManager
 
-from .chunk_search import EmbeddingChunkSearcher, SearchQuery
+from .chunk_search import (
+    EmbeddingChunkSearcher,
+    KeywordChunkSearcher,
+    SearchQuery,
+    rank_and_merge_results,
+)
+from .lexical_scoring import parse_lexical_query
 from .models import NotebookInfo, SearchResult
 
 __all__ = [
@@ -34,12 +41,12 @@ logger = logging.getLogger(__name__)
 
 
 class SearchService:
-    """Service for semantic search and active notebook listing.
+    """Service for hybrid keyword + semantic search and active notebook listing.
 
     All queries are strictly scoped by `user_id` and restricted to active
     (`UserFileDO.is_active == "Y"`) `.note` files. When `embedding_model` is
-    `None`, `search_chunks` returns an empty list while `list_notebooks`
-    remains available.
+    `None`, `search_chunks` still executes lexical `#keyword` and transcript
+    search via `KeywordChunkSearcher`.
     """
 
     def __init__(
@@ -51,12 +58,13 @@ class SearchService:
 
         Args:
             session_manager: Async SQLAlchemy session manager for querying
-                `UserFileDO` and `NotePageContentDO`.
+                `UserFileDO`, `NotePageMetadataDO`, and `NotePageContentDO`.
             embedding_model: Optional configured embedding backend used to
                 embed search queries. May be bound later during startup once
                 AI capability platforms finish loading.
         """
         self.session_manager = session_manager
+        self._keyword_searcher = KeywordChunkSearcher()
         self._embedding_searcher = EmbeddingChunkSearcher(embedding_model)
 
     @property
@@ -109,11 +117,11 @@ class SearchService:
         date_after: str | None = None,
         date_before: str | None = None,
     ) -> list[SearchResult]:
-        """Search active `.note` pages semantically similar to `query`.
+        """Search active `.note` pages by `#keyword` tags, OCR text, and vector similarity.
 
         Args:
             user_id: Owner user ID performing the search.
-            query: Natural-language search query string.
+            query: Keyword (`#tag`), phrase, or semantic search query string.
             top_n: Maximum number of ranked results to return.
             name_filter: Optional case-insensitive substring filter on notebook
                 filenames.
@@ -123,7 +131,7 @@ class SearchService:
                 whose inferred date is on or before this date.
 
         Returns:
-            List of `SearchResult` sorted by descending cosine similarity.
+            List of `SearchResult` sorted by descending hybrid relevance score.
         """
         if top_n <= 0 or not query or not query.strip():
             return []
@@ -143,21 +151,23 @@ class SearchService:
             return []
 
         query_unit = await self._embedding_searcher.embed_query(query)
-        if query_unit is None:
+        if query_unit is None and parse_lexical_query(query) is None:
             return []
 
         search_query = SearchQuery(
             user_id=user_id,
             raw_query=query,
-            top_n=top_n,
+            top_n=top_n * 2,
             name_filter=name_filter,
             after_date=after_date,
             before_date=before_date,
         )
         async with self.session_manager.session() as session:
-            return await self._embedding_searcher.search(
+            keyword_hits = await self._keyword_searcher.search(session, search_query)
+            embedding_hits = await self._embedding_searcher.search(
                 session, search_query, query_unit
             )
+        return rank_and_merge_results(keyword_hits, embedding_hits, top_n=top_n)
 
 
 SEARCH_SERVICE_KEY: web.AppKey[SearchService] = web.AppKey("search_service")

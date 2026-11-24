@@ -1,9 +1,16 @@
-"""Notebook page-chunk search primitives and vector similarity searcher.
+"""Modular keyword and vector page-chunk searchers and hybrid result ranking.
 
-Separates per-strategy page-chunk retrieval from `SearchService` orchestration so
-queries validate bounds once, compute embeddings outside SQLite transactions, score
-candidate vectors off the `asyncio` event loop, and load `text_content` snippets only
-for the top-ranked winning pages.
+Provides two complementary retrieval strategies for active `.note` pages sharing a
+single SQLite read snapshot:
+- `KeywordChunkSearcher`: Matches native Supernote page keywords (`NotePageMetadataDO`)
+  and SQL-prefiltered OCR transcripts (`NotePageContentDO`) via `lexical_scoring`,
+  running CPU scoring off the `asyncio` event loop.
+- `EmbeddingChunkSearcher`: Computes cosine similarity off the `asyncio` event loop
+  against stored page embeddings above `_MIN_VECTOR_SCORE` (`0.25`), loading snippets
+  only for top-ranked pages.
+
+`rank_and_merge_results` deduplicates hits across both searchers and combines scores
+monotonically in `[0.25, 1.0]`.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ from dataclasses import dataclass
 from datetime import date
 
 import numpy as np
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from supernote.server.ai.base import AIError
@@ -28,17 +35,32 @@ from supernote.server.ai.models.embedding import (
     validate_embedding_vector,
 )
 from supernote.server.db.models.file import UserFileDO
-from supernote.server.db.models.note_processing import NotePageContentDO
+from supernote.server.db.models.note_processing import (
+    NotePageContentDO,
+    NotePageMetadataDO,
+)
 from supernote.server.utils.note_content import infer_page_date
 
+from .lexical_scoring import (
+    ParsedQuery,
+    build_lexical_preview,
+    extract_centered_snippet,
+    parse_lexical_query,
+    score_page_lexical,
+    sql_prefilter_terms,
+)
 from .models import SearchResult
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "EmbeddingChunkSearcher",
+    "KeywordChunkSearcher",
     "SearchQuery",
+    "rank_and_merge_results",
 ]
+
+_MIN_VECTOR_SCORE = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +92,28 @@ class _EmbeddingRow:
     embedding_json: str
 
 
+type _ScoredKeywordRow = tuple[
+    float, int, str, int, str, str | None, tuple[str, ...], str | None
+]
+
+
+def _parse_keywords_json(raw_json: str) -> tuple[str, ...]:
+    """Extract non-empty `KEYWORD` strings from `NotePageMetadataDO.keywords_json`."""
+    try:
+        items = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(items, list):
+        return ()
+    return tuple(
+        kw
+        for item in items
+        if isinstance(item, dict)
+        and isinstance(raw := item.get("KEYWORD"), str)
+        and (kw := raw.strip())
+    )
+
+
 def _matches_date_bounds(
     page_id: str,
     after_date: date | None,
@@ -82,6 +126,10 @@ def _matches_date_bounds(
     if before_date and (page_day is None or page_day > before_date):
         return False, None
     return True, (page_day.isoformat() if page_day else None)
+
+
+def _page_key(file_id: int, page_id: str, page_index: int) -> tuple[int, str]:
+    return (file_id, f"id:{page_id}" if page_id else f"idx:{page_index}")
 
 
 def _apply_active_file_filters[*Ts](
@@ -98,6 +146,194 @@ def _apply_active_file_filters[*Ts](
             UserFileDO.file_name.icontains(query.name_filter, autoescape=True)
         )
     return stmt
+
+
+def _score_keyword_candidates(
+    parsed: ParsedQuery,
+    meta_rows: Sequence[tuple[int, int, str, str, str]],
+    content_rows: Sequence[tuple[int, int, str, str | None, str]],
+    after_date: date | None,
+    before_date: date | None,
+) -> list[_ScoredKeywordRow]:
+    content_by_key: dict[
+        tuple[int, str], tuple[int, str, int, str, str | None, str]
+    ] = {}
+    for file_id, page_index, page_id, text_content, file_name in content_rows:
+        if not text_content or not text_content.strip():
+            continue
+        date_ok, date_str = _matches_date_bounds(page_id, after_date, before_date)
+        if date_ok:
+            content_by_key[_page_key(file_id, page_id, page_index)] = (
+                file_id,
+                file_name,
+                page_index,
+                page_id,
+                date_str,
+                text_content,
+            )
+
+    scored: list[_ScoredKeywordRow] = []
+    for file_id, page_index, page_id, keywords_json, file_name in meta_rows:
+        date_ok, date_str = _matches_date_bounds(page_id, after_date, before_date)
+        if not date_ok:
+            continue
+        kws = _parse_keywords_json(keywords_json)
+        if not kws:
+            continue
+        paired = content_by_key.pop(_page_key(file_id, page_id, page_index), None)
+        text_val = paired[5] if paired is not None else None
+        page_score = score_page_lexical(parsed, kws, text_val)
+        if page_score > 0.0:
+            scored.append(
+                (
+                    page_score,
+                    file_id,
+                    file_name,
+                    page_index,
+                    page_id,
+                    date_str,
+                    kws,
+                    text_val,
+                )
+            )
+
+    for (
+        file_id,
+        file_name,
+        page_index,
+        page_id,
+        date_str,
+        text_val,
+    ) in content_by_key.values():
+        page_score = score_page_lexical(parsed, (), text_val)
+        if page_score > 0.0:
+            scored.append(
+                (
+                    page_score,
+                    file_id,
+                    file_name,
+                    page_index,
+                    page_id,
+                    date_str,
+                    (),
+                    text_val,
+                )
+            )
+
+    scored.sort(key=lambda item: (-round(item[0], 6), item[1], item[3]))
+    return scored
+
+
+class KeywordChunkSearcher:
+    """Searches native Supernote page keywords and SQL-prefiltered OCR transcripts."""
+
+    async def search(
+        self, session: AsyncSession, query: SearchQuery
+    ) -> list[SearchResult]:
+        parsed = parse_lexical_query(query.raw_query)
+        if parsed is None or query.top_n <= 0:
+            return []
+
+        meta_stmt = _apply_active_file_filters(
+            select(
+                NotePageMetadataDO.file_id,
+                NotePageMetadataDO.page_index,
+                NotePageMetadataDO.page_id,
+                NotePageMetadataDO.keywords_json,
+                UserFileDO.file_name,
+            )
+            .join(
+                UserFileDO,
+                (UserFileDO.id == NotePageMetadataDO.file_id)
+                & (UserFileDO.user_id == NotePageMetadataDO.user_id),
+            )
+            .where(NotePageMetadataDO.user_id == query.user_id)
+            .where(NotePageMetadataDO.keywords_json != "[]")
+            .where(NotePageMetadataDO.keywords_json != ""),
+            query,
+        )
+        meta_rows = [tuple(r) for r in (await session.execute(meta_stmt)).all()]
+
+        content_rows: list[tuple[int, int, str, str | None, str]] = []
+        if parsed.sig_tokens:
+            content_stmt = _apply_active_file_filters(
+                select(
+                    NotePageContentDO.file_id,
+                    NotePageContentDO.page_index,
+                    NotePageContentDO.page_id,
+                    NotePageContentDO.text_content,
+                    UserFileDO.file_name,
+                )
+                .join(UserFileDO, UserFileDO.id == NotePageContentDO.file_id)
+                .where(NotePageContentDO.text_content.isnot(None))
+                .where(NotePageContentDO.text_content != ""),
+                query,
+            )
+            ascii_terms, cjk_terms = sql_prefilter_terms(parsed, query.raw_query)
+            for stem in ascii_terms:
+                content_stmt = content_stmt.where(
+                    NotePageContentDO.text_content.icontains(stem, autoescape=True)
+                )
+            for stem in cjk_terms:
+                content_stmt = content_stmt.where(
+                    NotePageContentDO.text_content.contains(stem, autoescape=True)
+                )
+            content_rows = [
+                tuple(r) for r in (await session.execute(content_stmt)).all()
+            ]
+
+        scored = await asyncio.to_thread(
+            _score_keyword_candidates,
+            parsed,
+            meta_rows,
+            content_rows,
+            query.after_date,
+            query.before_date,
+        )
+        if not scored:
+            return []
+
+        top_scored = scored[: query.top_n]
+        missing_text_pairs = [
+            (fid, pid)
+            for _, fid, _, _, pid, _, _, text_val in top_scored
+            if text_val is None and pid
+        ]
+        backfill_text: dict[tuple[int, str], str] = {}
+        if missing_text_pairs:
+            extra_rows = (
+                await session.execute(
+                    select(
+                        NotePageContentDO.file_id,
+                        NotePageContentDO.page_id,
+                        NotePageContentDO.text_content,
+                    ).where(
+                        tuple_(
+                            NotePageContentDO.file_id, NotePageContentDO.page_id
+                        ).in_(missing_text_pairs)
+                    )
+                )
+            ).all()
+            backfill_text = {
+                (r.file_id, r.page_id): r.text_content
+                for r in extra_rows
+                if r.text_content and r.text_content.strip()
+            }
+
+        return [
+            SearchResult(
+                file_id=fid,
+                file_name=fname,
+                page_index=pidx,
+                page_id=pid,
+                score=score,
+                text_preview=build_lexical_preview(
+                    kws, text_val or backfill_text.get((fid, pid)), parsed
+                ),
+                date=dstr,
+            )
+            for score, fid, fname, pidx, pid, dstr, kws, text_val in top_scored
+        ]
 
 
 def _score_embedding_rows(
@@ -120,8 +356,9 @@ def _score_embedding_rows(
         if not math.isfinite(cand_norm) or math.isclose(cand_norm, 0.0, abs_tol=1e-12):
             continue
 
-        raw_cos = float(np.dot(query_unit, cand / cand_norm))
-        scored.append((row, max(-1.0, min(1.0, raw_cos))))
+        score = min(1.0, float(np.dot(query_unit, cand / cand_norm)))
+        if score >= _MIN_VECTOR_SCORE:
+            scored.append((row, score))
 
     scored.sort(
         key=lambda item: (-round(item[1], 6), item[0].file_id, item[0].page_index)
@@ -130,7 +367,7 @@ def _score_embedding_rows(
 
 
 class EmbeddingChunkSearcher:
-    """Searches page vector embeddings by cosine similarity."""
+    """Searches page vector embeddings by cosine similarity above `_MIN_VECTOR_SCORE`."""
 
     def __init__(self, embedding_model: EmbeddingModel | None) -> None:
         self.embedding_model = embedding_model
@@ -222,8 +459,10 @@ class EmbeddingChunkSearcher:
                 )
             )
         ).all()
+        parsed = parse_lexical_query(query.raw_query)
+        terms = parsed.sig_stems if parsed else ()
         text_by_id = {
-            r.id: r.text_content[:200]
+            r.id: extract_centered_snippet(r.text_content, terms)
             for r in text_rows
             if r.text_content and r.text_content.strip()
         }
@@ -240,3 +479,67 @@ class EmbeddingChunkSearcher:
             )
             for row, score in winners
         ]
+
+
+def _best_by_key(hits: Sequence[SearchResult]) -> dict[tuple[int, str], SearchResult]:
+    best: dict[tuple[int, str], SearchResult] = {}
+    for hit in hits:
+        key = _page_key(hit.file_id, hit.page_id, hit.page_index)
+        if key not in best or hit.score > best[key].score:
+            best[key] = hit
+    return best
+
+
+def rank_and_merge_results(
+    keyword_results: Sequence[SearchResult],
+    embedding_results: Sequence[SearchResult],
+    top_n: int,
+) -> list[SearchResult]:
+    """Deduplicate keyword and vector hits, fuse scores in `[0.25, 1.0]`, and return top `top_n`."""
+    if top_n <= 0:
+        return []
+
+    kw_by_key = _best_by_key([h for h in keyword_results if h.score > 0.0])
+    vec_by_key = _best_by_key(
+        [h for h in embedding_results if h.score >= _MIN_VECTOR_SCORE]
+    )
+
+    scored_entries: list[tuple[tuple[float, float, float, int, int], SearchResult]] = []
+    for key in kw_by_key.keys() | vec_by_key.keys():
+        kw_hit = kw_by_key.get(key)
+        vec_hit = vec_by_key.get(key)
+        kw_score = kw_hit.score if kw_hit is not None else 0.0
+        vec_score = min(1.0, vec_hit.score) if vec_hit is not None else 0.0
+        high, low = max(kw_score, vec_score), min(kw_score, vec_score)
+        fused = min(1.0, high + 0.5 * low * (1.0 - high))
+
+        anchor = kw_hit or vec_by_key[key]
+        kw_preview = kw_hit.text_preview.strip() if kw_hit is not None else ""
+        vec_preview = vec_hit.text_preview.strip() if vec_hit is not None else ""
+        if kw_preview and not kw_preview.startswith("Keywords: "):
+            preview = kw_preview
+        elif vec_preview:
+            preview = vec_preview
+        else:
+            preview = kw_preview
+
+        merged = SearchResult(
+            file_id=anchor.file_id,
+            file_name=anchor.file_name,
+            page_index=anchor.page_index,
+            page_id=anchor.page_id,
+            score=fused,
+            text_preview=preview,
+            date=anchor.date,
+        )
+        sort_key = (
+            -round(fused, 6),
+            -round(kw_score, 6),
+            -round(vec_score, 6),
+            merged.file_id,
+            merged.page_index,
+        )
+        scored_entries.append((sort_key, merged))
+
+    scored_entries.sort(key=lambda item: item[0])
+    return [entry for _, entry in scored_entries[:top_n]]
